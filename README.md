@@ -152,7 +152,7 @@ Instructions:
 
 ### Server Working Example
 
-Please refer to this [fully working example](examples/simple_server/simple_server.ino)
+Please refer to this [fully working example](https://github.com/IPdotSetAF/ESPAsyncHTTPUpdateServer/blob/master/examples/simple_server/simple_server.ino)
 
 ## TODO:
 - Custom CSS support
