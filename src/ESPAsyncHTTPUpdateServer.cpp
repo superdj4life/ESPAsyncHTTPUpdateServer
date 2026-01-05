@@ -10,6 +10,7 @@
         #include <SPIFFS.h>
     #endif
     #include <Update.h>
+    #include <esp_partition.h>
 #elif defined(ESP8266)
     #include <flash_hal.h>
     #include <FS.h>
@@ -132,9 +133,11 @@ void ESPAsyncHTTPUpdateServer::setup(AsyncWebServer *server, const String &path,
             // handler for the file upload, gets the sketch bytes, and writes
             // them through the Update object
 
-            _updateType = request->getParam("name")->value() == "filesystem"?
-                    UpdateType::FILE_SYSTEM :
-                    UpdateType::FIRMWARE;
+            // Determine update type from form parameter OR filename
+            String formName = request->getParam("name") ? request->getParam("name")->value() : "";
+            int otaType = (formName == "filesystem" || filename.indexOf(".spiffs.") >= 0 || filename.indexOf(".littlefs.") >= 0 || filename.indexOf(".ffat.") >= 0) ? U_SPIFFS : U_FLASH;
+
+            _updateType = (otaType == U_SPIFFS) ? UpdateType::FILE_SYSTEM : UpdateType::FIRMWARE;
 
             if (!index)
             {
@@ -163,27 +166,17 @@ void ESPAsyncHTTPUpdateServer::setup(AsyncWebServer *server, const String &path,
                     }
                 }
 
-                Log("Update: %s\n", filename.c_str());
+                Log("Update: %s, Type: %d\n", filename.c_str(), otaType);
 #ifdef ESP8266
                 Update.runAsync(true);
-#endif
                 if (_updateType == UpdateType::FILE_SYSTEM)
                 {
                     Log("updating filesystem\n");
-#ifdef ESP8266
                     int command = U_FS;
                     size_t fsSize = ((size_t)FS_end - (size_t)FS_start);
                     close_all_fs();
-#elif defined(ESP32)
-                    int command = U_SPIFFS;
-    #ifdef ESPASYNCHTTPUPDATESERVER_LITTLEFS
-                    size_t fsSize = LittleFS.totalBytes();
-    #else
-                    size_t fsSize = SPIFFS.totalBytes();
-    #endif
-#endif
                     if (!Update.begin(fsSize, command))
-                    { // start with max available size
+                    {
 #ifdef ESPASYNCHTTPUPDATESERVER_DEBUG
                         Update.printError(ESPASYNCHTTPUPDATESERVER_SerialOutput);
 #endif
@@ -193,13 +186,59 @@ void ESPAsyncHTTPUpdateServer::setup(AsyncWebServer *server, const String &path,
                 {
                     Log("updating flash\n");
                     uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
-                    if (!Update.begin(maxSketchSpace, U_FLASH)) // start with max available size
+                    if (!Update.begin(maxSketchSpace, U_FLASH))
                         _setUpdaterError();
                 }
+#elif defined(ESP32)
+                // For ESP32: Don't call Update.begin() here for filesystem updates
+                // We'll call it in the first write with the partition size, and Update.end(true) will adjust
+                if (_updateType != UpdateType::FILE_SYSTEM)
+                {
+                    Log("updating flash\n");
+                    uint32_t maxSketchSpace = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+                    if (!Update.begin(maxSketchSpace, U_FLASH))
+                        _setUpdaterError();
+                }
+                else
+                {
+                    Log("updating filesystem (deferred begin)\n");
+                }
+#endif
             }
 
             if (_authenticated && len && _updateResult == UpdateResult::UPDATE_OK)
             {
+#ifdef ESP32
+                // For ESP32 filesystem updates, call Update.begin() on first write
+                if (_updateType == UpdateType::FILE_SYSTEM && !Update.isRunning())
+                {
+                    // Get partition size directly from partition table instead of mounted filesystem
+                    const esp_partition_t* partition = esp_partition_find_first(
+                        ESP_PARTITION_TYPE_DATA,
+                        ESP_PARTITION_SUBTYPE_DATA_SPIFFS,
+                        NULL
+                    );
+
+                    size_t fsSize = 0;
+                    if (partition != NULL) {
+                        fsSize = partition->size;
+                        Log("Found SPIFFS partition, size: %u bytes\n", fsSize);
+                    } else {
+                        Log("ERROR: Could not find SPIFFS partition!\n");
+                        _setUpdaterError();
+                        return;
+                    }
+
+                    Log("Calling Update.begin(%u, U_SPIFFS)\n", fsSize);
+                    if (!Update.begin(fsSize, U_SPIFFS))
+                    {
+                        Log("Update.begin() FAILED!\n");
+                        _setUpdaterError();
+                        return;
+                    }
+                    Log("Update.begin() SUCCESS\n");
+                }
+#endif
                 Log(".");
                 if (Update.write(data, len) != len)
                     _setUpdaterError();
@@ -207,15 +246,21 @@ void ESPAsyncHTTPUpdateServer::setup(AsyncWebServer *server, const String &path,
 
             if (_authenticated && final && _updateResult == UpdateResult::UPDATE_OK)
             {
+                Log("\nFinalizing update...\n");
+                Log("Total bytes written: %u\n", Update.progress());
+                Log("Calling Update.end(true) to finalize with actual size\n");
                 if (Update.end(true))
                 { // true to set the size to the current progress
-                    Log("Update Success.\n");
+                    Log("Update Success. Final size: %u bytes\n", Update.progress());
                     _updateResult = UpdateResult::UPDATE_OK;
                     if(onUpdateEnd)
                         onUpdateEnd(_updateType, _updateResult);
                 }
                 else
+                {
+                    Log("Update.end() FAILED!\n");
                     _setUpdaterError();
+                }
 #ifdef ESPASYNCHTTPUPDATESERVER_DEBUG
                 ESPASYNCHTTPUPDATESERVER_SerialOutput.setDebugOutput(false);
 #endif
